@@ -332,6 +332,33 @@ function requestRematch(room, player) {
 // ------------------------------------------------------------
 // HTTP helpers
 // ------------------------------------------------------------
+function json(res, status, body) {
+  const data = Buffer.from(JSON.stringify(body), 'utf8');
+  res.writeHead(status, {
+    'Content-Type':'application/json; charset=utf-8',
+    'Content-Length':data.length,
+    'Cache-Control':'no-store'
+  });
+  res.end(data);
+}
+function readBody(req) {
+  return new Promise((resolve,reject)=>{
+    let data='';
+    req.on('data',chunk=>{
+      data+=chunk;
+      if(data.length>100000){
+        reject(new Error('TOO_LARGE'));
+        req.destroy();
+      }
+    });
+    req.on('end',()=>{
+      try{ resolve(data ? JSON.parse(data) : {}); }
+      catch(e){ reject(e); }
+    });
+    req.on('error',reject);
+  });
+}
+
 function sendText(res, status, contentType, text, cache='no-store') {
   const data = Buffer.from(text, 'utf8');
   res.writeHead(status, {

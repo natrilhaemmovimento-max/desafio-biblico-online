@@ -1,9 +1,11 @@
 {
   "name": "desafio-biblico-online",
-  "version": "1.0.1",
+  "version": "2.1.0",
   "private": true,
   "scripts": {
-    "start": "node server.js"
+    "start": "node launcher.js",
+    "check": "node --check server.js && node --check launcher.js && node --check app.js && node --check test/smoke.js",
+    "test": "node test/smoke.js"
   },
   "engines": {
     "node": ">=18"

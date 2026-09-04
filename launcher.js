@@ -23,11 +23,50 @@ function replaceRegex(regex, newText, label) {
   console.log(`✓ ${label}`);
 }
 
-// 1) Limite configurável de jogadores por sala.
+// 1) Regras da partida e limite configurável de jogadores por sala.
+replaceText(
+  "const QUESTION_MS = 20_000;",
+  "const QUESTION_MS = Math.max(100, Number(process.env.QUESTION_MS || 15_000));",
+  'quinze segundos por pergunta'
+);
+
 replaceText(
   "const REVEAL_MS = 4_000;",
-  "const REVEAL_MS = 4_000;\nconst MAX_PLAYERS = Math.max(2, Number(process.env.MAX_PLAYERS || 50));",
-  'limite configurável de jogadores'
+  "const REVEAL_MS = Math.max(50, Number(process.env.REVEAL_MS || 4_000));\nconst COUNTDOWN_MS = Math.max(50, Number(process.env.COUNTDOWN_MS || 3_000));\nconst ANSWER_REVEAL_DELAY_MS = Math.max(10, Number(process.env.ANSWER_REVEAL_DELAY_MS || 550));\nconst QUESTIONS_PER_MATCH = Math.max(1, Math.min(30, Number(process.env.QUESTIONS_PER_MATCH || 15)));\nconst MAX_PLAYERS = Math.max(2, Number(process.env.MAX_PLAYERS || 50));",
+  'quinze perguntas e limite de jogadores'
+);
+
+// 1b) Seleção por nível, priorizando a categoria escolhida.
+replaceText(
+`function selectQuestions(category) {
+  const cat = cleanCategory(category);
+  function pool(d) {
+    const filtered = QUESTIONS.filter(q => q.d === d && (cat === 'Todas' || q.cat === cat));
+    return filtered.length >= 4 ? filtered : QUESTIONS.filter(q => q.d === d);
+  }
+  const raw = [
+    ...shuffle(pool(1)).slice(0,3),
+    ...shuffle(pool(2)).slice(0,3),
+    ...shuffle(pool(3)).slice(0,4)
+  ];
+  const positions = balancedPositions(raw.length);
+  return raw.map((q,i)=>prepareQuestion(q,positions[i]));
+}`,
+`function cleanDifficulty(v) {
+  const n = Number(v);
+  return n === 1 || n === 2 || n === 3 ? n : 1;
+}
+function selectQuestions(category, difficulty, excludedKeys=new Set()) {
+  const cat = cleanCategory(category);
+  const level = cleanDifficulty(difficulty);
+  const available = QUESTIONS.filter(q => q.d === level && !excludedKeys.has(q.q));
+  const preferred = cat === 'Todas' ? available : available.filter(q => q.cat === cat);
+  const fallback = cat === 'Todas' ? [] : available.filter(q => q.cat !== cat);
+  const raw = [...shuffle(preferred), ...shuffle(fallback)].slice(0, QUESTIONS_PER_MATCH);
+  const positions = balancedPositions(raw.length);
+  return raw.map((q,i)=>prepareQuestion(q,positions[i]));
+}`,
+  'escolha de nível'
 );
 
 // 2) Estado da sala passa a informar anfitrião e limite.
@@ -37,6 +76,7 @@ replaceRegex(
   return {
     code: room.code,
     category: room.category,
+    difficulty: room.difficulty,
     status: room.status,
     hostId: room.hostId,
     maxPlayers: MAX_PLAYERS,
@@ -51,8 +91,20 @@ replaceRegex(
 
 // 3) Criador vira anfitrião.
 replaceText(
+  "function createRoom(name, category) {",
+  "function createRoom(name, category, difficulty) {",
+  'nível definido pelo criador'
+);
+
+replaceText(
+  "    code, category: cleanCategory(category),",
+  "    code, category: cleanCategory(category), difficulty: cleanDifficulty(difficulty),",
+  'nível salvo na sala'
+);
+
+replaceText(
   "    status: 'waiting',\n    players: [player],",
-  "    status: 'waiting',\n    hostId: player.id,\n    players: [player],",
+  "    status: 'waiting',\n    hostId: player.id,\n    players: [player],\n    usedQuestionKeys: new Set(),\n    lastQuestionKeys: [],\n    countdownStartsAt: 0,\n    lastReveal: null,\n    lastResult: null,",
   'anfitrião da sala'
 );
 
@@ -114,11 +166,69 @@ function resetMatch(room) {`,
   'funções de anfitrião e saída'
 );
 
+// 5a) Cada revanche recebe perguntas diferentes da rodada anterior.
+replaceText(
+  "  room.questions = selectQuestions(room.category);",
+`  let nextQuestions = selectQuestions(room.category, room.difficulty, room.usedQuestionKeys);
+  if (nextQuestions.length < QUESTIONS_PER_MATCH) {
+    room.usedQuestionKeys = new Set(room.lastQuestionKeys);
+    nextQuestions = selectQuestions(room.category, room.difficulty, room.usedQuestionKeys);
+  }
+  room.questions = nextQuestions;
+  room.lastQuestionKeys = nextQuestions.map(q=>q.q);
+  for (const q of nextQuestions) room.usedQuestionKeys.add(q.q);`,
+  'perguntas novas na revanche'
+);
+
+// 5b) Limpa estados usados para reconexão ao iniciar outra partida.
+replaceText(
+`  room.questionIndex = -1;
+  room.matchNumber++;`,
+`  room.questionIndex = -1;
+  room.countdownStartsAt = 0;
+  room.lastReveal = null;
+  room.lastResult = null;
+  room.matchNumber++;`,
+  'limpeza do estado de reconexão'
+);
+
 // 6) Contagem regressiva aceita 2 ou mais jogadores.
 replaceText(
   "  if (room.players.length !== 2) return;",
   "  if (room.players.length < 2) return;",
   'início com múltiplos jogadores'
+);
+
+replaceText(
+`  const startsAt = now() + 3000;
+  broadcast(room, 'match-starting', {`,
+`  const startsAt = now() + COUNTDOWN_MS;
+  room.countdownStartsAt = startsAt;
+  broadcast(room, 'match-starting', {`,
+  'contagem regressiva recuperável'
+);
+
+replaceText(
+`  }, 3000);
+}
+
+function questionPayload(room) {`,
+`  }, COUNTDOWN_MS);
+}
+
+function questionPayload(room) {`,
+  'duração da contagem regressiva'
+);
+
+replaceText(
+`  room.status = 'playing';
+  room.questionStartedAt = now();
+  for (const p of room.players) p.answer = null;`,
+`  room.status = 'playing';
+  room.questionStartedAt = now();
+  room.lastReveal = null;
+  for (const p of room.players) p.answer = null;`,
+  'estado da pergunta recuperável'
 );
 
 // 7) Quando alguém responde, todos recebem a contagem.
@@ -156,9 +266,44 @@ replaceText(
 
   if (room.players.every(p=>p.answer)) {
     clearTimeout(room.questionTimer);
-    room.questionTimer = setTimeout(()=>endQuestion(room, 'all-answered'), 550);
+    room.questionTimer = setTimeout(()=>endQuestion(room, 'all-answered'), ANSWER_REVEAL_DELAY_MS);
   }`,
   'respostas de todos os jogadores'
+);
+
+// 7b) Guarda a última revelação para restaurar a tela após recarregar.
+replaceText(
+`  room.status = 'reveal';
+  touch(room);
+  broadcast(room, 'reveal', {
+    index: room.questionIndex,
+    correctIndex: q.c,
+    correctText: q.a[q.c],
+    reference: q.ref,
+    explanation: q.exp,
+    reason,
+    players: room.players.map(p=>({
+      id:p.id, name:p.name, score:p.score, heart:p.heart,
+      answer:p.answer
+    }))
+  });`,
+`  room.status = 'reveal';
+  touch(room);
+  const reveal = {
+    index: room.questionIndex,
+    correctIndex: q.c,
+    correctText: q.a[q.c],
+    reference: q.ref,
+    explanation: q.exp,
+    reason,
+    players: room.players.map(p=>({
+      id:p.id, name:p.name, score:p.score, heart:p.heart,
+      answer:p.answer
+    }))
+  };
+  room.lastReveal = reveal;
+  broadcast(room, 'reveal', reveal);`,
+  'revelação recuperável'
 );
 
 // 8) Resultado vira ranking completo.
@@ -177,13 +322,15 @@ replaceRegex(
   const winnerIds = ranking.filter(p=>p.score===topScore).map(p=>p.id);
   const winnerId = winnerIds.length === 1 ? winnerIds[0] : null;
 
-  broadcast(room, 'match-finished', {
+  const result = {
     winnerId,
     winnerIds,
     tie: winnerIds.length > 1,
     players: ranking.map(publicPlayer),
     room: roomSummary(room)
-  });
+  };
+  room.lastResult = result;
+  broadcast(room, 'match-finished', result);
 }
 function requestRematch(room, player) {
   if (room.status !== 'finished') return {ok:false,error:'NOT_FINISHED'};
@@ -193,6 +340,32 @@ function requestRematch(room, player) {
   return {ok:true};
 }`,
   'ranking final multiplayer'
+);
+
+// 8b) Monta um retrato seguro da partida para recarregamentos e reconexões.
+replaceText(
+`// ------------------------------------------------------------
+// HTTP helpers
+// ------------------------------------------------------------`,
+`function syncState(room, player) {
+  const state = {
+    room: roomSummary(room, player.id),
+    serverNow: now()
+  };
+  if (room.status === 'countdown') state.startsAt = room.countdownStartsAt;
+  if ((room.status === 'playing' || room.status === 'reveal') && room.questionIndex >= 0) {
+    state.question = questionPayload(room);
+    state.yourAnswer = player.answer ? {choice: player.answer.choice} : null;
+  }
+  if (room.status === 'reveal') state.reveal = room.lastReveal;
+  if (room.status === 'finished') state.result = room.lastResult;
+  return state;
+}
+
+// ------------------------------------------------------------
+// HTTP helpers
+// ------------------------------------------------------------`,
+  'sincronização após recarregar'
 );
 
 // 9) O servidor passa a usar o app.js externo (mantém fallback para o antigo).
@@ -213,6 +386,12 @@ replaceText(
 );
 
 // 10) Entrada não inicia automaticamente e respeita MAX_PLAYERS.
+replaceText(
+  "      const {room,player}=createRoom(body.name,body.category);",
+  "      const {room,player}=createRoom(body.name,body.category,body.difficulty);",
+  'nível recebido ao criar a sala'
+);
+
 replaceText(
 `      if(room.status!=='waiting' || room.players.length>=2) {
         return json(res,409,{ok:false,error:'ROOM_UNAVAILABLE'});
@@ -253,6 +432,14 @@ replaceText(
 
 // 12) Conexão/desconexão atualiza a lista para todos.
 replaceText(
+`      sendPlayer(player,'connected',{
+        room:roomSummary(room,player.id)
+      });`,
+`      sendPlayer(player,'connected',syncState(room,player));`,
+  'reconexão envia a tela atual'
+);
+
+replaceText(
 `      const other=opponent(room,player);
       if(other) sendPlayer(other,'opponent-connection',{connected:true,opponent:publicPlayer(player)});`,
 `      broadcastRoomState(room);`,
@@ -264,6 +451,26 @@ replaceText(
         if(op) sendPlayer(op,'opponent-connection',{connected:false,opponent:publicPlayer(player)});`,
 `        broadcastRoomState(room);`,
   'desconexão atualizada para todos'
+);
+
+// 13) A consulta de estado também devolve a tela atual da partida.
+replaceText(
+`      return json(res,200,{ok:true,room:roomSummary(room,player.id)});`,
+`      return json(res,200,{ok:true,...syncState(room,player)});`,
+  'estado completo da partida'
+);
+
+// 14) Endpoint de saúde para o Render.
+replaceText(
+`  try {
+    if (req.method==='POST' && urlObj.pathname==='/api/create-room') {`,
+`  try {
+    if (req.method==='GET' && urlObj.pathname==='/api/health') {
+      return json(res,200,{ok:true,service:'desafio-biblico-online',rooms:rooms.size});
+    }
+
+    if (req.method==='POST' && urlObj.pathname==='/api/create-room') {`,
+  'verificação de saúde'
 );
 
 fs.writeFileSync(runtimePath, code, 'utf8');

@@ -11,8 +11,12 @@ let audioCtx = null;
 let lastResult = null;
 
 function show(id) {
-  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
-  $(id).classList.add('active');
+  document.querySelectorAll('.screen').forEach(s => {
+    const active = s.id === id;
+    s.classList.toggle('active', active);
+    s.setAttribute('aria-hidden', active ? 'false' : 'true');
+  });
+  window.scrollTo({top: 0, behavior: 'smooth'});
 }
 
 function toast(msg) {
@@ -123,6 +127,7 @@ function closeEvents() {
 
 function connectEvents() {
   closeEvents();
+  setConnectionStatus('connecting');
   const q = new URLSearchParams({
     code: session.code,
     playerId: session.playerId,
@@ -134,7 +139,8 @@ function connectEvents() {
       handleEvent(JSON.parse(e.data));
     } catch (_) {}
   };
-  eventSource.onerror = () => {};
+  eventSource.onopen = () => setConnectionStatus('online');
+  eventSource.onerror = () => setConnectionStatus('connecting');
 }
 
 function isHost(room = roomState) {
@@ -146,11 +152,40 @@ function sortedPlayers(players) {
 }
 
 function installMultiplayerUI() {
+  document.documentElement.lang = 'pt-BR';
+  document.title = 'Desafio Bíblico Online — Multiplayer';
+
+  const topbar = document.querySelector('.topbar');
+  if (topbar && !$('connectionStatus')) {
+    const status = document.createElement('div');
+    status.id = 'connectionStatus';
+    status.className = 'connectionStatus offline';
+    status.setAttribute('role', 'status');
+    status.setAttribute('aria-live', 'polite');
+    status.innerHTML = '<i></i><span>Pronto</span>';
+    topbar.insertBefore(status, $('soundBtn'));
+  }
+
   const tag = document.querySelector('.onlineTag');
   if (tag) tag.textContent = 'MULTIPLAYER ONLINE';
 
   const heroP = document.querySelector('#homeScreen .hero p');
-  if (heroP) heroP.textContent = 'Crie uma sala, envie o link para seus amigos e descubram juntos quem conhece mais a Palavra.';
+  if (heroP) heroP.textContent = 'Escolha o nível, crie uma sala e desafie seus amigos em 15 perguntas bíblicas.';
+
+  const categorySelect = $('categorySelect');
+  if (categorySelect && !$('difficultySelect')) {
+    categorySelect.insertAdjacentHTML('afterend', `
+      <label for="difficultySelect">Nível da partida</label>
+      <select id="difficultySelect" aria-label="Nível da partida">
+        <option value="1">Fácil</option>
+        <option value="2">Médio</option>
+        <option value="3">Difícil</option>
+      </select>`);
+  }
+
+  const features = document.querySelectorAll('#homeScreen .features > div');
+  if (features[0]) features[0].innerHTML = '<b>15</b><span>PERGUNTAS</span>';
+  if (features[1]) features[1].innerHTML = '<b>15s</b><span>POR PERGUNTA</span>';
 
   const waitingTitle = document.querySelector('#waitingScreen h2');
   if (waitingTitle) waitingTitle.textContent = 'Sala criada!';
@@ -166,6 +201,14 @@ function installMultiplayerUI() {
       </div>
       <div id="playersList" class="multiPlayersList"></div>
     `;
+  }
+
+  const roomCode = $('roomCodeBig');
+  if (roomCode && !$('roomSettings')) {
+    const settings = document.createElement('div');
+    settings.id = 'roomSettings';
+    settings.className = 'roomSettings';
+    roomCode.insertAdjacentElement('afterend', settings);
   }
 
   const leaveBtn = $('leaveWaitingBtn');
@@ -194,6 +237,8 @@ function installMultiplayerUI() {
     .playersBox{display:block!important}
     .multiPlayersHeader{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px}
     .multiPlayersHeader span{font-size:12px;opacity:.78}
+    .roomSettings{margin:10px auto 16px;display:flex;justify-content:center;flex-wrap:wrap;gap:7px;color:#aebed2;font-size:10px;font-weight:800;letter-spacing:.035em}
+    .roomSettings span{padding:7px 10px;border:1px solid rgba(255,255,255,.11);border-radius:999px;background:rgba(255,255,255,.04)}
     .multiPlayersList{display:grid;gap:8px;max-height:310px;overflow:auto;padding-right:2px}
     .multiPlayerRow{display:grid;grid-template-columns:36px 1fr auto;align-items:center;gap:10px;padding:10px 12px;border:1px solid rgba(255,255,255,.12);border-radius:14px;background:rgba(255,255,255,.04)}
     .multiPlayerRow.me{border-color:rgba(91,224,154,.55);background:rgba(91,224,154,.08)}
@@ -220,11 +265,101 @@ function installMultiplayerUI() {
   if (opName) opName.textContent = 'Líder';
   const opStatus = $('opAnswerStatus');
   if (opStatus) opStatus.textContent = 'Aguardando respostas…';
+
+  const gameMeta = document.querySelector('.gameMeta');
+  if (gameMeta && !$('difficultyText')) {
+    const difficulty = document.createElement('span');
+    difficulty.id = 'difficultyText';
+    difficulty.className = 'difficultyText';
+    gameMeta.insertBefore(difficulty, $('timerText'));
+  }
+
+  const testSound = $('testSoundBtn');
+  if (testSound && !$('helpBtn')) {
+    const help = document.createElement('button');
+    help.id = 'helpBtn';
+    help.className = 'textBtn helpBtn';
+    help.textContent = '❔ Como jogar';
+    help.onclick = openHelp;
+    testSound.insertAdjacentElement('afterend', help);
+  }
+
+  if (!$('helpDialog')) {
+    document.body.insertAdjacentHTML('beforeend', `
+      <div id="helpDialog" class="helpDialog hidden" role="dialog" aria-modal="true" aria-labelledby="helpTitle">
+        <div class="helpCard">
+          <button id="closeHelpBtn" class="closeHelp" aria-label="Fechar instruções">×</button>
+          <span class="helpIcon">📖</span>
+          <h2 id="helpTitle">Como jogar</h2>
+          <ol>
+            <li><b>Crie uma sala</b> e compartilhe o link ou código.</li>
+            <li>Espere seus amigos entrarem e toque em <b>Iniciar</b>.</li>
+            <li>Responda antes do tempo acabar. Quanto mais rápido, mais pontos.</li>
+            <li>A Segunda Chance protege você do primeiro erro.</li>
+          </ol>
+          <button id="understoodBtn" class="primary">ENTENDI, VAMOS JOGAR!</button>
+        </div>
+      </div>`);
+    $('closeHelpBtn').onclick = closeHelp;
+    $('understoodBtn').onclick = closeHelp;
+    $('helpDialog').onclick = e => { if (e.target === $('helpDialog')) closeHelp(); };
+  }
+
+  $('toast').setAttribute('role', 'status');
+  $('toast').setAttribute('aria-live', 'polite');
+
+  style.textContent += `
+    .connectionStatus{margin-left:auto;margin-right:10px;display:flex;align-items:center;gap:6px;padding:6px 9px;border:1px solid rgba(255,255,255,.12);border-radius:999px;font-size:10px;font-weight:850;color:#aab9cd;background:rgba(255,255,255,.04)}
+    .connectionStatus i{width:7px;height:7px;border-radius:50%;background:#8290a3;box-shadow:0 0 0 3px rgba(130,144,163,.12)}
+    .connectionStatus.online i{background:#5be09a;box-shadow:0 0 0 3px rgba(91,224,154,.13)}
+    .connectionStatus.connecting i{background:#f5bb43;box-shadow:0 0 0 3px rgba(245,187,67,.13);animation:pulse 1.1s infinite}
+    .difficultyText{color:#aab9cd!important;font-size:9px!important;letter-spacing:.08em}
+    .timerBar.urgent #timerFill{background:#ff667a!important;box-shadow:0 0 12px rgba(255,102,122,.55)}
+    .helpBtn{margin-left:8px}
+    .helpDialog{position:fixed;inset:0;z-index:200;background:rgba(1,6,14,.86);backdrop-filter:blur(8px);display:grid;place-items:center;padding:20px}
+    .helpDialog.hidden{display:none}
+    .helpCard{position:relative;width:min(460px,100%);padding:28px 24px 24px;border-radius:22px;background:#0a1a2b;border:1px solid rgba(245,187,67,.35);box-shadow:0 24px 80px rgba(0,0,0,.55)}
+    .helpCard h2{text-align:center;margin:4px 0 18px;color:#fff}
+    .helpIcon{display:block;text-align:center;font-size:42px}
+    .helpCard ol{margin:0 0 22px;padding-left:22px;color:#bdc9d8;line-height:1.55}
+    .helpCard li{margin:9px 0;padding-left:4px}.helpCard b{color:#f5d27a}
+    .closeHelp{position:absolute;right:12px;top:10px;border:0;background:transparent;color:#aab9cd;font-size:30px;cursor:pointer}
+    .answer:focus-visible,.primary:focus-visible,.secondary:focus-visible,.textBtn:focus-visible,input:focus-visible,select:focus-visible{outline:3px solid #65b4ff;outline-offset:3px}
+    @keyframes pulse{50%{opacity:.45}}
+    @media(max-width:520px){.connectionStatus span{display:none}.connectionStatus{padding:7px;margin-right:6px}.helpBtn{display:block;margin:3px auto 0}.gameMeta{gap:8px}.difficultyText{flex:1;text-align:center}}
+    @media(prefers-reduced-motion:reduce){*,*:before,*:after{scroll-behavior:auto!important;animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}}
+  `;
+}
+
+function setConnectionStatus(state) {
+  const el = $('connectionStatus');
+  if (!el) return;
+  el.className = `connectionStatus ${state}`;
+  const label = state === 'online' ? 'Conectado' : state === 'connecting' ? 'Reconectando' : 'Pronto';
+  el.querySelector('span').textContent = label;
+}
+
+function openHelp() {
+  $('helpDialog').classList.remove('hidden');
+  $('understoodBtn').focus();
+}
+
+function closeHelp() {
+  $('helpDialog').classList.add('hidden');
+  $('helpBtn').focus();
 }
 
 function updateWaiting(room) {
   roomState = room;
   $('roomCodeBig').textContent = room.code;
+  const levelLabels = {1: 'Fácil', 2: 'Médio', 3: 'Difícil'};
+  if ($('roomSettings')) {
+    $('roomSettings').innerHTML = `
+      <span>📚 ${escapeHtml(room.category)}</span>
+      <span>🎯 ${levelLabels[room.difficulty] || 'Fácil'}</span>
+      <span>❓ 15 perguntas</span>
+      <span>⏱️ 15 segundos</span>`;
+  }
 
   const list = $('playersList');
   const count = $('playersCount');
@@ -272,13 +407,16 @@ function renderLiveRanking(players) {
 
   const me = ranked.find(p => p.id === session.playerId);
   const leader = ranked[0];
+  const leaders = leader ? ranked.filter(p => (p.score || 0) === (leader.score || 0)) : [];
   if (me) {
     $('youName').textContent = me.name;
     $('youScore').textContent = me.score || 0;
     $('youHeart').textContent = me.heart ? '❤️ 1' : '♡ 0';
   }
   if (leader) {
-    $('opName').textContent = leader.id === session.playerId ? 'Você lidera' : leader.name;
+    $('opName').textContent = leaders.length > 1
+      ? 'Empate na liderança'
+      : leader.id === session.playerId ? 'Você lidera' : leader.name;
     $('opScore').textContent = leader.score || 0;
     $('opHeart').textContent = `${ranked.length} 👥`;
   }
@@ -286,11 +424,7 @@ function renderLiveRanking(players) {
 
 function handleEvent(msg) {
   if (msg.type === 'connected') {
-    roomState = msg.room;
-    if (msg.room.status === 'waiting') {
-      show('waitingScreen');
-      updateWaiting(msg.room);
-    }
+    applySyncState(msg);
     return;
   }
 
@@ -344,6 +478,33 @@ function handleEvent(msg) {
   }
 }
 
+function applySyncState(state) {
+  if (!state || !state.room) return;
+  roomState = state.room;
+  if (state.room.status === 'waiting') {
+    show('waitingScreen');
+    updateWaiting(state.room);
+  } else if (state.room.status === 'countdown') {
+    renderLiveRanking(state.room.players);
+    showCountdown(state.startsAt || Date.now());
+  } else if (state.room.status === 'playing' && state.question) {
+    renderQuestion(state.question);
+    if (state.yourAnswer) {
+      const buttons = [...document.querySelectorAll('.answer')];
+      buttons.forEach(b => b.disabled = true);
+      if (buttons[state.yourAnswer.choice]) buttons[state.yourAnswer.choice].classList.add('selected');
+      $('yourAnswerStatus').textContent = '✓ Resposta já enviada';
+      const answered = state.room.players.filter(p => p.answered).length;
+      $('opAnswerStatus').textContent = `${answered}/${state.room.players.length} responderam`;
+    }
+  } else if (state.room.status === 'reveal' && state.question && state.reveal) {
+    renderQuestion(state.question);
+    renderReveal(state.reveal);
+  } else if (state.room.status === 'finished' && state.result) {
+    renderResult(state.result);
+  }
+}
+
 function showCountdown(startsAt) {
   show('gameScreen');
   $('countdown').classList.remove('hidden');
@@ -363,6 +524,10 @@ function renderQuestion(msg) {
   $('countdown').classList.add('hidden');
   $('questionCount').textContent = `${msg.index + 1}/${msg.total}`;
   $('categoryText').textContent = msg.category.toUpperCase();
+  if ($('difficultyText')) {
+    const labels = {1: 'FÁCIL', 2: 'MÉDIA', 3: 'DIFÍCIL'};
+    $('difficultyText').textContent = labels[msg.difficulty] || '';
+  }
   $('questionText').textContent = msg.text;
   $('yourAnswerStatus').textContent = 'Escolha uma resposta';
   $('opAnswerStatus').textContent = `0/${msg.players.length} responderam`;
@@ -389,15 +554,21 @@ async function submitAnswer(i, button) {
     await api('/api/action', sessionBody({action: 'answer', choice: i}));
   } catch (e) {
     toast('Não foi possível enviar a resposta.');
+    document.querySelectorAll('.answer').forEach(b => b.disabled = false);
+    button.classList.remove('selected');
+    $('yourAnswerStatus').textContent = 'Tente novamente';
   }
 }
 
 function startTimer(startedAt, limit) {
   cancelAnimationFrame(timerRAF);
+  const timerBar = document.querySelector('.timerBar');
+  timerBar?.classList.remove('urgent');
   const run = () => {
     const remaining = Math.max(0, limit - (Date.now() - startedAt));
     $('timerFill').style.width = (remaining / limit * 100) + '%';
     $('timerText').textContent = Math.ceil(remaining / 1000) + 's';
+    timerBar?.classList.toggle('urgent', remaining > 0 && remaining <= 5000);
     if (remaining > 0) timerRAF = requestAnimationFrame(run);
   };
   run();
@@ -406,6 +577,8 @@ function startTimer(startedAt, limit) {
 function renderReveal(msg) {
   cancelAnimationFrame(timerRAF);
   $('timerFill').style.width = '0%';
+  $('timerText').textContent = '—';
+  document.querySelector('.timerBar')?.classList.remove('urgent');
   const mine = msg.players.find(p => p.id === session.playerId);
   renderLiveRanking(msg.players.map(p => ({id: p.id, name: p.name, score: p.score, heart: p.heart})));
 
@@ -453,8 +626,13 @@ function renderResult(msg) {
   show('resultScreen');
 
   const final = $('finalRanking');
+  let previousScore = null;
+  let previousPosition = 0;
   final.innerHTML = ranking.map((p, i) => {
-    const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `${i + 1}º`;
+    const position = p.score === previousScore ? previousPosition : i + 1;
+    previousScore = p.score;
+    previousPosition = position;
+    const medal = position === 1 ? '🥇' : position === 2 ? '🥈' : position === 3 ? '🥉' : `${position}º`;
     return `
       <div class="finalRankRow ${p.id === session.playerId ? 'me' : ''}">
         <div class="pos">${medal}</div>
@@ -510,8 +688,16 @@ async function createRoom() {
   saveName();
   ensureAudio();
   sound('start');
+  const button = $('createBtn');
+  const originalText = button.textContent;
+  button.disabled = true;
+  button.textContent = 'CRIANDO SALA…';
   try {
-    const j = await api('/api/create-room', {name, category: $('categorySelect').value});
+    const j = await api('/api/create-room', {
+      name,
+      category: $('categorySelect').value,
+      difficulty: Number($('difficultySelect').value)
+    });
     session = {code: j.code, playerId: j.playerId, token: j.token};
     sessionStorage.setItem('dbo_session', JSON.stringify(session));
     history.replaceState(null, '', `/?room=${j.code}`);
@@ -520,6 +706,9 @@ async function createRoom() {
     connectEvents();
   } catch (e) {
     toast('Não foi possível criar a sala.');
+  } finally {
+    button.disabled = false;
+    button.textContent = originalText;
   }
 }
 
@@ -537,6 +726,10 @@ async function joinRoom() {
   saveName();
   ensureAudio();
   sound('start');
+  const button = $('joinBtn');
+  const originalText = button.textContent;
+  button.disabled = true;
+  button.textContent = 'ENTRANDO…';
   try {
     const j = await api('/api/join-room', {name, code});
     session = {code: j.code, playerId: j.playerId, token: j.token};
@@ -549,6 +742,9 @@ async function joinRoom() {
     if (e.code === 'ROOM_NOT_FOUND') toast('Sala não encontrada.');
     else if (e.code === 'ROOM_UNAVAILABLE') toast('Essa sala já começou ou atingiu o limite de jogadores.');
     else toast('Não foi possível entrar.');
+  } finally {
+    button.disabled = false;
+    button.textContent = originalText;
   }
 }
 
@@ -632,6 +828,7 @@ async function goHome() {
   sessionStorage.removeItem('dbo_session');
   history.replaceState(null, '', '/');
   show('homeScreen');
+  setConnectionStatus('offline');
 }
 
 async function tryRestore() {
@@ -643,16 +840,8 @@ async function tryRestore() {
     const r = await fetch('/api/state?' + q);
     if (!r.ok) throw new Error('RESTORE');
     const j = await r.json();
-    roomState = j.room;
     connectEvents();
-    if (j.room.status === 'waiting') {
-      show('waitingScreen');
-      updateWaiting(j.room);
-    } else {
-      show('waitingScreen');
-      updateWaiting(j.room);
-      toast('Reconectando à partida…');
-    }
+    applySyncState(j);
     return true;
   } catch (_) {
     session = null;
@@ -680,6 +869,17 @@ $('roomCodeInput').addEventListener('input', e => {
   e.target.value = e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6);
 });
 $('nameInput').addEventListener('change', saveName);
+$('nameInput').addEventListener('keydown', e => {
+  if (e.key === 'Enter') createRoom();
+});
+$('roomCodeInput').addEventListener('keydown', e => {
+  if (e.key === 'Enter') joinRoom();
+});
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && !$('helpDialog').classList.contains('hidden')) closeHelp();
+});
+window.addEventListener('online', () => setConnectionStatus(session ? 'connecting' : 'offline'));
+window.addEventListener('offline', () => setConnectionStatus('connecting'));
 window.addEventListener('beforeunload', closeEvents);
 
 (async function init() {

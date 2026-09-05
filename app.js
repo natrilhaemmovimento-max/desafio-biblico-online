@@ -9,6 +9,8 @@ let timerRAF = null;
 let soundOn = localStorage.getItem('dbo_sound') !== '0';
 let audioCtx = null;
 let lastResult = null;
+let chatMessages = [];
+let chatUnread = 0;
 
 function show(id) {
   document.querySelectorAll('.screen').forEach(s => {
@@ -147,6 +149,11 @@ function isHost(room = roomState) {
   return !!room && !!session && room.hostId === session.playerId;
 }
 
+function isWaitingNext(room = roomState) {
+  if (!room || !session) return false;
+  return !!room.players.find(p => p.id === session.playerId)?.waitingNext;
+}
+
 function sortedPlayers(players) {
   return [...(players || [])].sort((a, b) => (b.score || 0) - (a.score || 0) || a.name.localeCompare(b.name, 'pt-BR'));
 }
@@ -223,6 +230,13 @@ function installMultiplayerUI() {
 
   const scoreBoard = document.querySelector('#gameScreen .scoreboard');
   if (scoreBoard && !$('liveRanking')) {
+    const spectator = document.createElement('div');
+    spectator.id = 'spectatorBanner';
+    spectator.className = 'spectatorBanner hidden';
+    spectator.setAttribute('role', 'status');
+    spectator.innerHTML = '<b>👀 Você está assistindo</b><span>Você entrará automaticamente na próxima rodada.</span>';
+    scoreBoard.insertAdjacentElement('beforebegin', spectator);
+
     const ranking = document.createElement('div');
     ranking.id = 'liveRanking';
     ranking.className = 'liveRanking';
@@ -258,6 +272,26 @@ function installMultiplayerUI() {
     .finalRankRow .pos{font-size:20px;font-weight:900;text-align:center}
     .finalRankRow .fname{font-weight:850;text-align:left}
     .finalRankRow .fscore{font-weight:950;font-size:18px}
+    .spectatorBanner{display:flex;flex-direction:column;gap:3px;margin:0 0 12px;padding:12px 14px;border:1px solid rgba(245,187,67,.5);border-radius:14px;background:rgba(245,187,67,.1);color:#f8d778;text-align:center}
+    .spectatorBanner span{font-size:11px;color:#c9d2de}.spectatorBanner.hidden{display:none}
+    .chatFab{position:fixed;z-index:170;right:16px;bottom:16px;display:flex;align-items:center;gap:7px;padding:12px 16px;border:1px solid rgba(101,180,255,.55);border-radius:999px;background:#126ad5;color:#fff;font:800 13px inherit;box-shadow:0 12px 35px rgba(0,0,0,.45);cursor:pointer}
+    .chatFab.hidden,.chatPanel.hidden,.chatUnread.hidden{display:none}
+    .chatUnread{display:grid;place-items:center;min-width:19px;height:19px;padding:0 5px;border-radius:10px;background:#ff5670;color:#fff;font-size:10px}
+    .chatPanel{position:fixed;z-index:180;right:12px;bottom:76px;width:min(390px,calc(100vw - 24px));height:min(520px,calc(100vh - 100px));display:flex;flex-direction:column;overflow:hidden;border:1px solid rgba(101,180,255,.4);border-radius:22px;background:#071522;box-shadow:0 24px 75px rgba(0,0,0,.65)}
+    .chatHeader{display:flex;align-items:center;justify-content:space-between;padding:15px 16px;border-bottom:1px solid rgba(255,255,255,.1);background:#0b2238}
+    .chatHeader div{display:flex;flex-direction:column;gap:2px}.chatHeader b{color:#fff}.chatHeader span{font-size:10px;color:#9fb0c2}
+    .chatHeader button{border:0;background:transparent;color:#bdc9d8;font-size:27px;line-height:1;cursor:pointer}
+    .chatMessages{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:9px}
+    .chatEmpty{margin:auto;text-align:center;color:#8395a9;font-size:12px}
+    .chatMessage{max-width:86%;padding:9px 11px;border-radius:14px 14px 14px 4px;background:rgba(255,255,255,.08);align-self:flex-start;color:#e9f0f7}
+    .chatMessage.me{align-self:flex-end;border-radius:14px 14px 4px 14px;background:#145fae}
+    .chatMessage .chatMeta{display:flex;gap:7px;align-items:center;margin-bottom:3px;font-size:9px;color:#9fb0c2}.chatMessage.me .chatMeta{color:#cbe4ff}
+    .chatMessage .chatText{font-size:13px;line-height:1.35;overflow-wrap:anywhere}
+    .quickMessages{display:flex;gap:6px;padding:9px 11px;overflow-x:auto;border-top:1px solid rgba(255,255,255,.08)}
+    .quickMessages button{flex:0 0 auto;padding:7px 9px;border:1px solid rgba(255,255,255,.12);border-radius:999px;background:rgba(255,255,255,.05);color:#cad5e1;font-size:10px;cursor:pointer}
+    .chatForm{display:grid;grid-template-columns:1fr 46px;gap:8px;padding:11px;background:#0b1d2e}
+    .chatForm input{min-width:0;margin:0!important;padding:11px 12px!important;border-radius:12px!important}
+    .chatForm button{border:0;border-radius:12px;background:#126ad5;color:white;font-size:20px;cursor:pointer}
   `;
   document.head.appendChild(style);
 
@@ -296,6 +330,8 @@ function installMultiplayerUI() {
             <li>Espere seus amigos entrarem e toque em <b>Iniciar</b>.</li>
             <li>Responda antes do tempo acabar. Quanto mais rápido, mais pontos.</li>
             <li>A Segunda Chance protege você do primeiro erro.</li>
+            <li>Quem chegar durante a partida assiste e entra na rodada seguinte.</li>
+            <li>Use o <b>Chat</b> para conversar com o pessoal da sala.</li>
           </ol>
           <button id="understoodBtn" class="primary">ENTENDI, VAMOS JOGAR!</button>
         </div>
@@ -303,6 +339,41 @@ function installMultiplayerUI() {
     $('closeHelpBtn').onclick = closeHelp;
     $('understoodBtn').onclick = closeHelp;
     $('helpDialog').onclick = e => { if (e.target === $('helpDialog')) closeHelp(); };
+  }
+
+  if (!$('chatFab')) {
+    document.body.insertAdjacentHTML('beforeend', `
+      <button id="chatFab" class="chatFab hidden" type="button" aria-label="Abrir bate-papo">
+        💬 <span>Chat</span><b id="chatUnread" class="chatUnread hidden">0</b>
+      </button>
+      <section id="chatPanel" class="chatPanel hidden" aria-label="Bate-papo da sala">
+        <header class="chatHeader">
+          <div><b>💬 Bate-papo</b><span>Converse com o pessoal da sala</span></div>
+          <button id="closeChatBtn" type="button" aria-label="Fechar bate-papo">×</button>
+        </header>
+        <div id="chatMessages" class="chatMessages" aria-live="polite">
+          <div class="chatEmpty">Ainda não há mensagens. Dê um alô! 👋</div>
+        </div>
+        <div class="quickMessages" aria-label="Mensagens rápidas">
+          <button type="button" data-chat="Boa sorte! 🙏">Boa sorte! 🙏</button>
+          <button type="button" data-chat="Boa! 👏">Boa! 👏</button>
+          <button type="button" data-chat="Quase! 😅">Quase! 😅</button>
+          <button type="button" data-chat="Parabéns! 🎉">Parabéns! 🎉</button>
+        </div>
+        <form id="chatForm" class="chatForm">
+          <input id="chatInput" maxlength="160" autocomplete="off" placeholder="Digite uma mensagem..." aria-label="Mensagem" />
+          <button id="sendChatBtn" type="submit" aria-label="Enviar mensagem">➤</button>
+        </form>
+      </section>`);
+    $('chatFab').onclick = openChat;
+    $('closeChatBtn').onclick = closeChat;
+    $('chatForm').onsubmit = e => {
+      e.preventDefault();
+      sendChat($('chatInput').value);
+    };
+    document.querySelectorAll('[data-chat]').forEach(button => {
+      button.onclick = () => sendChat(button.dataset.chat);
+    });
   }
 
   $('toast').setAttribute('role', 'status');
@@ -349,9 +420,104 @@ function closeHelp() {
   $('helpBtn').focus();
 }
 
+function setChatVisible(visible) {
+  const button = $('chatFab');
+  if (!button) return;
+  button.classList.toggle('hidden', !visible);
+  if (!visible) $('chatPanel')?.classList.add('hidden');
+}
+
+function openChat() {
+  $('chatPanel').classList.remove('hidden');
+  chatUnread = 0;
+  updateChatUnread();
+  requestAnimationFrame(() => {
+    const box = $('chatMessages');
+    box.scrollTop = box.scrollHeight;
+    $('chatInput').focus();
+  });
+}
+
+function closeChat() {
+  $('chatPanel').classList.add('hidden');
+  $('chatFab').focus();
+}
+
+function updateChatUnread() {
+  const badge = $('chatUnread');
+  if (!badge) return;
+  badge.textContent = String(Math.min(chatUnread, 99));
+  badge.classList.toggle('hidden', chatUnread === 0);
+}
+
+function renderChatMessages() {
+  const box = $('chatMessages');
+  if (!box) return;
+  if (!chatMessages.length) {
+    box.innerHTML = '<div class="chatEmpty">Ainda não há mensagens. Dê um alô! 👋</div>';
+    return;
+  }
+  box.innerHTML = chatMessages.map(message => {
+    const mine = message.playerId === session?.playerId;
+    const time = new Date(message.sentAt).toLocaleTimeString('pt-BR', {hour: '2-digit', minute: '2-digit'});
+    return `
+      <div class="chatMessage ${mine ? 'me' : ''}">
+        <div class="chatMeta"><b>${escapeHtml(message.name)}</b><span>${time}</span></div>
+        <div class="chatText">${escapeHtml(message.text)}</div>
+      </div>`;
+  }).join('');
+  box.scrollTop = box.scrollHeight;
+}
+
+function receiveChatMessage(message) {
+  if (!message || chatMessages.some(item => item.id === message.id)) return;
+  chatMessages.push(message);
+  if (chatMessages.length > 50) chatMessages.shift();
+  if ($('chatPanel').classList.contains('hidden') && message.playerId !== session?.playerId) {
+    chatUnread++;
+    updateChatUnread();
+  }
+  renderChatMessages();
+}
+
+async function sendChat(value) {
+  const message = String(value || '').trim();
+  if (!session || !message) return;
+  const sendButton = $('sendChatBtn');
+  sendButton.disabled = true;
+  try {
+    await api('/api/action', sessionBody({action: 'chat', message}));
+    $('chatInput').value = '';
+  } catch (e) {
+    toast(e.code === 'CHAT_SLOW_DOWN' ? 'Aguarde um instante para enviar outra mensagem.' : 'Não foi possível enviar a mensagem.');
+  } finally {
+    setTimeout(() => { sendButton.disabled = false; }, 350);
+  }
+}
+
+function updateSpectatorMode() {
+  const banner = $('spectatorBanner');
+  if (!banner) return;
+  const waiting = isWaitingNext();
+  banner.classList.toggle('hidden', !waiting);
+  if (waiting) {
+    banner.innerHTML = '<b>👀 Você está assistindo esta rodada</b><span>Converse no chat. Você entrará automaticamente na próxima.</span>';
+  }
+}
+
 function updateWaiting(room) {
   roomState = room;
+  setChatVisible(!!session);
   $('roomCodeBig').textContent = room.code;
+  const waitingTitle = document.querySelector('#waitingScreen h2');
+  const waitingText = document.querySelector('#waitingScreen > p');
+  if (room.status === 'waiting') {
+    if (waitingTitle) waitingTitle.textContent = 'Sala pronta!';
+    if (waitingText) waitingText.textContent = 'Compartilhe o código ou o link. O anfitrião inicia quando todos estiverem na sala.';
+  } else if (isWaitingNext(room)) {
+    if (waitingTitle) waitingTitle.textContent = 'Você entrou na sala!';
+    if (waitingText) waitingText.textContent = 'A rodada já começou. Você poderá acompanhar e entrará automaticamente na próxima.';
+  }
   const levelLabels = {1: 'Fácil', 2: 'Médio', 3: 'Difícil'};
   if ($('roomSettings')) {
     $('roomSettings').innerHTML = `
@@ -371,9 +537,9 @@ function updateWaiting(room) {
     const me = p.id === session.playerId;
     return `
       <div class="multiPlayerRow ${me ? 'me' : ''}">
-        <div class="avatar">${host ? '👑' : '🙂'}</div>
+        <div class="avatar">${host ? '👑' : p.waitingNext ? '👀' : '🙂'}</div>
         <div class="name">${escapeHtml(p.name)}${me ? ' (você)' : ''}</div>
-        <div class="status">${p.connected ? '🟢 ONLINE' : '⚪ ENTRANDO'}</div>
+        <div class="status">${p.waitingNext ? '⏳ PRÓXIMA' : p.connected ? '🟢 ONLINE' : '⚪ ENTRANDO'}</div>
       </div>`;
   }).join('');
 
@@ -430,6 +596,7 @@ function handleEvent(msg) {
 
   if (msg.type === 'room-updated') {
     roomState = msg.room;
+    updateSpectatorMode();
     if (msg.room.status === 'waiting') {
       if (!$('waitingScreen').classList.contains('active')) show('waitingScreen');
       updateWaiting(msg.room);
@@ -441,6 +608,7 @@ function handleEvent(msg) {
 
   if (msg.type === 'match-starting') {
     roomState = msg.room;
+    updateSpectatorMode();
     renderLiveRanking(msg.room.players);
     showCountdown(msg.startsAt);
     return;
@@ -472,6 +640,11 @@ function handleEvent(msg) {
     return;
   }
 
+  if (msg.type === 'chat-message') {
+    receiveChatMessage(msg.message);
+    return;
+  }
+
   if (msg.type === 'rematch-state') {
     roomState.players = msg.players;
     return;
@@ -481,6 +654,12 @@ function handleEvent(msg) {
 function applySyncState(state) {
   if (!state || !state.room) return;
   roomState = state.room;
+  setChatVisible(true);
+  if (Array.isArray(state.messages)) {
+    chatMessages = state.messages;
+    renderChatMessages();
+  }
+  updateSpectatorMode();
   if (state.room.status === 'waiting') {
     show('waitingScreen');
     updateWaiting(state.room);
@@ -494,19 +673,21 @@ function applySyncState(state) {
       buttons.forEach(b => b.disabled = true);
       if (buttons[state.yourAnswer.choice]) buttons[state.yourAnswer.choice].classList.add('selected');
       $('yourAnswerStatus').textContent = '✓ Resposta já enviada';
-      const answered = state.room.players.filter(p => p.answered).length;
-      $('opAnswerStatus').textContent = `${answered}/${state.room.players.length} responderam`;
+      const participants = state.room.players.filter(p => !p.waitingNext);
+      const answered = participants.filter(p => p.answered).length;
+      $('opAnswerStatus').textContent = `${answered}/${participants.length} responderam`;
     }
   } else if (state.room.status === 'reveal' && state.question && state.reveal) {
     renderQuestion(state.question);
     renderReveal(state.reveal);
   } else if (state.room.status === 'finished' && state.result) {
-    renderResult(state.result);
+    renderResult({...state.result, room: state.room});
   }
 }
 
 function showCountdown(startsAt) {
   show('gameScreen');
+  updateSpectatorMode();
   $('countdown').classList.remove('hidden');
   sound('start');
   const run = () => {
@@ -532,6 +713,7 @@ function renderQuestion(msg) {
   $('yourAnswerStatus').textContent = 'Escolha uma resposta';
   $('opAnswerStatus').textContent = `0/${msg.players.length} responderam`;
   $('revealBox').classList.add('hidden');
+  updateSpectatorMode();
   renderLiveRanking(msg.players);
 
   const box = $('answers');
@@ -541,12 +723,18 @@ function renderQuestion(msg) {
     b.className = 'answer';
     b.innerHTML = `<span class="letter">${letter}</span><span>${escapeHtml(msg.answers[i])}</span>`;
     b.onclick = () => submitAnswer(i, b);
+    if (isWaitingNext()) b.disabled = true;
     box.appendChild(b);
   });
+  if (isWaitingNext()) $('yourAnswerStatus').textContent = '👀 Assistindo — você joga na próxima rodada';
   startTimer(msg.startedAt, msg.timeLimitMs);
 }
 
 async function submitAnswer(i, button) {
+  if (isWaitingNext()) {
+    toast('Você entrará na próxima rodada.');
+    return;
+  }
   document.querySelectorAll('.answer').forEach(b => b.disabled = true);
   button.classList.add('selected');
   $('yourAnswerStatus').textContent = 'Enviando resposta…';
@@ -589,7 +777,10 @@ function renderReveal(msg) {
   });
 
   const title = $('revealTitle');
-  if (mine?.answer?.correct) {
+  if (isWaitingNext()) {
+    title.textContent = '👀 Você está assistindo esta rodada';
+    title.style.color = '#f5d27a';
+  } else if (mine?.answer?.correct) {
     title.textContent = `✅ +${mine.answer.points} pontos`;
     title.style.color = '#5be09a';
     sound('correct');
@@ -611,7 +802,9 @@ function renderReveal(msg) {
   $('referenceText').textContent = '📖 ' + msg.reference;
   $('explanationText').textContent = msg.explanation;
   $('revealBox').classList.remove('hidden');
-  $('yourAnswerStatus').textContent = mine?.answer?.correct ? 'Você acertou!' : mine?.answer?.heartUsed ? 'Sua Segunda Chance foi usada' : 'Você não pontuou';
+  $('yourAnswerStatus').textContent = isWaitingNext()
+    ? 'Você já está confirmado na próxima rodada'
+    : mine?.answer?.correct ? 'Você acertou!' : mine?.answer?.heartUsed ? 'Sua Segunda Chance foi usada' : 'Você não pontuou';
 
   const correctCount = msg.players.filter(p => p.answer?.correct).length;
   $('opAnswerStatus').textContent = `${correctCount} de ${msg.players.length} acertaram`;
@@ -668,7 +861,11 @@ function configureRestartButton(room) {
   roomState = room;
   const btn = $('rematchBtn');
   $('rematchStatus').textContent = '';
-  if (isHost(room)) {
+  if (isWaitingNext(room)) {
+    btn.disabled = true;
+    btn.textContent = '✅ VOCÊ ESTÁ NA PRÓXIMA RODADA';
+    $('rematchStatus').textContent = 'Aguarde o anfitrião iniciar. Enquanto isso, você pode conversar no chat.';
+  } else if (isHost(room)) {
     btn.disabled = false;
     btn.textContent = '🔄 JOGAR NOVAMENTE';
     btn.onclick = startMatch;
@@ -701,6 +898,7 @@ async function createRoom() {
     session = {code: j.code, playerId: j.playerId, token: j.token};
     sessionStorage.setItem('dbo_session', JSON.stringify(session));
     history.replaceState(null, '', `/?room=${j.code}`);
+    setChatVisible(true);
     show('waitingScreen');
     updateWaiting(j.room);
     connectEvents();
@@ -735,12 +933,15 @@ async function joinRoom() {
     session = {code: j.code, playerId: j.playerId, token: j.token};
     sessionStorage.setItem('dbo_session', JSON.stringify(session));
     history.replaceState(null, '', `/?room=${j.code}`);
+    roomState = j.room;
+    setChatVisible(true);
     show('waitingScreen');
     updateWaiting(j.room);
     connectEvents();
+    if (j.waitingNext) toast('A rodada está em andamento. Você entra na próxima!');
   } catch (e) {
     if (e.code === 'ROOM_NOT_FOUND') toast('Sala não encontrada.');
-    else if (e.code === 'ROOM_UNAVAILABLE') toast('Essa sala já começou ou atingiu o limite de jogadores.');
+    else if (e.code === 'ROOM_UNAVAILABLE') toast('Essa sala atingiu o limite de jogadores.');
     else toast('Não foi possível entrar.');
   } finally {
     button.disabled = false;
@@ -825,6 +1026,11 @@ async function goHome() {
   }
   session = null;
   roomState = null;
+  chatMessages = [];
+  chatUnread = 0;
+  setChatVisible(false);
+  renderChatMessages();
+  updateChatUnread();
   sessionStorage.removeItem('dbo_session');
   history.replaceState(null, '', '/');
   show('homeScreen');
@@ -877,6 +1083,7 @@ $('roomCodeInput').addEventListener('keydown', e => {
 });
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape' && !$('helpDialog').classList.contains('hidden')) closeHelp();
+  else if (e.key === 'Escape' && !$('chatPanel').classList.contains('hidden')) closeChat();
 });
 window.addEventListener('online', () => setConnectionStatus(session ? 'connecting' : 'offline'));
 window.addEventListener('offline', () => setConnectionStatus('connecting'));

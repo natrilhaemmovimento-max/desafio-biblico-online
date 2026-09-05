@@ -32,7 +32,7 @@ replaceText(
 
 replaceText(
   "const REVEAL_MS = 4_000;",
-  "const REVEAL_MS = Math.max(50, Number(process.env.REVEAL_MS || 4_000));\nconst COUNTDOWN_MS = Math.max(50, Number(process.env.COUNTDOWN_MS || 3_000));\nconst ANSWER_REVEAL_DELAY_MS = Math.max(10, Number(process.env.ANSWER_REVEAL_DELAY_MS || 550));\nconst QUESTIONS_PER_MATCH = Math.max(1, Math.min(30, Number(process.env.QUESTIONS_PER_MATCH || 15)));\nconst MAX_PLAYERS = Math.max(2, Number(process.env.MAX_PLAYERS || 50));",
+  "const REVEAL_MS = Math.max(50, Number(process.env.REVEAL_MS || 4_000));\nconst COUNTDOWN_MS = Math.max(50, Number(process.env.COUNTDOWN_MS || 3_000));\nconst ANSWER_REVEAL_DELAY_MS = Math.max(10, Number(process.env.ANSWER_REVEAL_DELAY_MS || 550));\nconst QUESTIONS_PER_MATCH = Math.max(1, Math.min(30, Number(process.env.QUESTIONS_PER_MATCH || 15)));\nconst MAX_PLAYERS = Math.max(2, Number(process.env.MAX_PLAYERS || 50));\nconst CHAT_MAX_MESSAGES = 50;\nconst CHAT_MAX_LENGTH = 160;\nconst CHAT_COOLDOWN_MS = 700;",
   'quinze perguntas e limite de jogadores'
 );
 
@@ -108,6 +108,12 @@ replaceText(
   'anfitrião da sala'
 );
 
+replaceText(
+  "    lastResult: null,\n    questions: [],",
+  "    lastResult: null,\n    messages: [],\n    nextMessageId: 1,\n    questions: [],",
+  'histórico de mensagens da sala'
+);
+
 // 4) Sala deixa de ser limitada a duas pessoas.
 replaceText(
   "  if (room.players.length >= 2) throw new Error('ROOM_FULL');",
@@ -115,11 +121,66 @@ replaceText(
   'limite multiplayer na entrada'
 );
 
+replaceText(
+  "function addPlayer(room, name) {",
+  "function addPlayer(room, name, waitingNext=false) {",
+  'entrada de espectador'
+);
+
+replaceText(
+  "    answer: null, rematch: false\n  };",
+  "    answer: null, rematch: false, waitingNext: false, lastChatAt: 0\n  };",
+  'estado inicial do anfitrião'
+);
+
+replaceText(
+  "    answer: null, rematch: false\n  };",
+  "    answer: null, rematch: false, waitingNext: !!waitingNext, lastChatAt: 0\n  };",
+  'estado de quem entra na sala'
+);
+
+replaceText(
+  "    answered: !!p.answer,\n    rematch: !!p.rematch",
+  "    answered: !!p.answer,\n    rematch: !!p.rematch,\n    waitingNext: !!p.waitingNext",
+  'estado público de espectador'
+);
+
 // 5) Helpers multiplayer antes de resetMatch.
 replaceText(
   "function resetMatch(room) {",
 `function broadcastRoomState(room) {
   broadcast(room, 'room-updated', {room: roomSummary(room)});
+}
+function activePlayers(room) {
+  return room.players.filter(p=>!p.waitingNext);
+}
+function cleanChatText(value) {
+  return String(value || '')
+    .replace(/[\\u0000-\\u001F\\u007F]/g, ' ')
+    .replace(/\\s+/g, ' ')
+    .trim()
+    .slice(0, CHAT_MAX_LENGTH);
+}
+function sendChatMessage(room, player, value) {
+  const text = cleanChatText(value);
+  if (!text) return {ok:false,error:'EMPTY_MESSAGE'};
+  const sentAt = now();
+  if (sentAt - (player.lastChatAt || 0) < CHAT_COOLDOWN_MS) {
+    return {ok:false,error:'CHAT_SLOW_DOWN'};
+  }
+  player.lastChatAt = sentAt;
+  const message = {
+    id: room.nextMessageId++,
+    playerId: player.id,
+    name: player.name,
+    text,
+    sentAt
+  };
+  room.messages.push(message);
+  if (room.messages.length > CHAT_MAX_MESSAGES) room.messages.shift();
+  touch(room);
+  broadcast(room, 'chat-message', {message});
+  return {ok:true,message};
 }
 function startByHost(room, player) {
   if (player.id !== room.hostId) return {ok:false,error:'NOT_HOST'};
@@ -156,7 +217,7 @@ function leaveRoom(room, player) {
   touch(room);
   broadcastRoomState(room);
 
-  if (room.status === 'playing' && room.players.every(p=>p.answer)) {
+  if (room.status === 'playing' && activePlayers(room).every(p=>p.answer)) {
     clearTimeout(room.questionTimer);
     room.questionTimer = setTimeout(()=>endQuestion(room, 'all-answered'), 250);
   }
@@ -190,6 +251,15 @@ replaceText(
   room.lastResult = null;
   room.matchNumber++;`,
   'limpeza do estado de reconexão'
+);
+
+replaceText(
+`    p.answer = null;
+    p.rematch = false;`,
+`    p.answer = null;
+    p.rematch = false;
+    p.waitingNext = false;`,
+  'espectadores entram na nova rodada'
 );
 
 // 6) Contagem regressiva aceita 2 ou mais jogadores.
@@ -231,6 +301,22 @@ replaceText(
   'estado da pergunta recuperável'
 );
 
+replaceText(
+`    timeLimitMs: QUESTION_MS,
+    startedAt: room.questionStartedAt,
+    players: room.players.map(publicPlayer)`,
+`    timeLimitMs: QUESTION_MS,
+    startedAt: room.questionStartedAt,
+    players: activePlayers(room).map(publicPlayer)`,
+  'pergunta enviada apenas aos participantes da rodada'
+);
+
+replaceText(
+  "  if (room.status !== 'playing') return {ok:false, error:'NOT_PLAYING'};",
+  "  if (room.status !== 'playing') return {ok:false, error:'NOT_PLAYING'};\n  if (player.waitingNext) return {ok:false, error:'NOT_ACTIVE'};",
+  'espectador não responde na rodada em curso'
+);
+
 // 7) Quando alguém responde, todos recebem a contagem.
 replaceText(
 `  const other = opponent(room, player);
@@ -256,19 +342,26 @@ replaceText(
     score: player.score
   });
 
-  const answeredCount = room.players.filter(p=>p.answer).length;
+  const participants = activePlayers(room);
+  const answeredCount = participants.filter(p=>p.answer).length;
   broadcast(room, 'player-answered', {
     index: room.questionIndex,
     playerId: player.id,
     answeredCount,
-    totalPlayers: room.players.length
+    totalPlayers: participants.length
   });
 
-  if (room.players.every(p=>p.answer)) {
+  if (participants.every(p=>p.answer)) {
     clearTimeout(room.questionTimer);
     room.questionTimer = setTimeout(()=>endQuestion(room, 'all-answered'), ANSWER_REVEAL_DELAY_MS);
   }`,
   'respostas de todos os jogadores'
+);
+
+replaceText(
+  "  for (const p of room.players) {\n    if (!p.answer) {",
+  "  for (const p of activePlayers(room)) {\n    if (!p.answer) {",
+  'tempo esgotado apenas para participantes da rodada'
 );
 
 // 7b) Guarda a última revelação para restaurar a tela após recarregar.
@@ -296,7 +389,7 @@ replaceText(
     reference: q.ref,
     explanation: q.exp,
     reason,
-    players: room.players.map(p=>({
+    players: activePlayers(room).map(p=>({
       id:p.id, name:p.name, score:p.score, heart:p.heart,
       answer:p.answer
     }))
@@ -315,7 +408,7 @@ replaceRegex(
   room.status = 'finished';
   touch(room);
 
-  const ranking = [...room.players].sort((a,b)=>
+  const ranking = [...activePlayers(room)].sort((a,b)=>
     b.score - a.score || a.name.localeCompare(b.name, 'pt-BR')
   );
   const topScore = ranking.length ? ranking[0].score : 0;
@@ -350,7 +443,8 @@ replaceText(
 `function syncState(room, player) {
   const state = {
     room: roomSummary(room, player.id),
-    serverNow: now()
+    serverNow: now(),
+    messages: room.messages.slice(-CHAT_MAX_MESSAGES)
   };
   if (room.status === 'countdown') state.startsAt = room.countdownStartsAt;
   if ((room.status === 'playing' || room.status === 'reveal') && room.questionIndex >= 0) {
@@ -404,12 +498,13 @@ replaceText(
       // Let response reach client before countdown event.
       setTimeout(()=>startCountdown(room),400);
       return;`,
-`      if(room.status!=='waiting' || room.players.length>=MAX_PLAYERS) {
+`      if(room.players.length>=MAX_PLAYERS) {
         return json(res,409,{ok:false,error:'ROOM_UNAVAILABLE'});
       }
-      const player=addPlayer(room,body.name);
+      const waitingNext = room.status !== 'waiting';
+      const player=addPlayer(room,body.name,waitingNext);
       json(res,200,{
-        ok:true, code, playerId:player.id, token:player.token,
+        ok:true, code, playerId:player.id, token:player.token, waitingNext,
         room:roomSummary(room,player.id)
       });
       setTimeout(()=>broadcastRoomState(room),50);
@@ -425,6 +520,7 @@ replaceText(
 `      if(body.action==='answer') result=registerAnswer(room,player,Number(body.choice));
       else if(body.action==='start') result=startByHost(room,player);
       else if(body.action==='leave') result=leaveRoom(room,player);
+      else if(body.action==='chat') result=sendChatMessage(room,player,body.message);
       else if(body.action==='rematch') result=requestRematch(room,player);
       else return json(res,400,{ok:false,error:'BAD_ACTION'});`,
   'ações de anfitrião e saída'

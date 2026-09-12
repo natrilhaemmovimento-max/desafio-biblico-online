@@ -32,7 +32,7 @@ replaceText(
 
 replaceText(
   "const REVEAL_MS = 4_000;",
-  "const REVEAL_MS = Math.max(50, Number(process.env.REVEAL_MS || 4_000));\nconst COUNTDOWN_MS = Math.max(50, Number(process.env.COUNTDOWN_MS || 3_000));\nconst ANSWER_REVEAL_DELAY_MS = Math.max(10, Number(process.env.ANSWER_REVEAL_DELAY_MS || 550));\nconst QUESTIONS_PER_MATCH = Math.max(1, Math.min(30, Number(process.env.QUESTIONS_PER_MATCH || 15)));\nconst MAX_PLAYERS = Math.max(2, Number(process.env.MAX_PLAYERS || 50));\nconst CHAT_MAX_MESSAGES = 50;\nconst CHAT_MAX_LENGTH = 160;\nconst CHAT_COOLDOWN_MS = 700;",
+  "const REVEAL_MS = Math.max(50, Number(process.env.REVEAL_MS || 4_000));\nconst COUNTDOWN_MS = Math.max(50, Number(process.env.COUNTDOWN_MS || 3_000));\nconst ANSWER_REVEAL_DELAY_MS = Math.max(10, Number(process.env.ANSWER_REVEAL_DELAY_MS || 550));\nconst DISCONNECT_GRACE_MS = Math.max(50, Number(process.env.DISCONNECT_GRACE_MS || 2_000));\nconst QUESTIONS_PER_MATCH = Math.max(1, Math.min(30, Number(process.env.QUESTIONS_PER_MATCH || 15)));\nconst MAX_PLAYERS = Math.max(2, Number(process.env.MAX_PLAYERS || 50));\nconst CHAT_MAX_MESSAGES = 50;\nconst CHAT_MAX_LENGTH = 160;\nconst CHAT_COOLDOWN_MS = 700;",
   'quinze perguntas e limite de jogadores'
 );
 
@@ -70,6 +70,15 @@ function selectQuestions(category, difficulty, excludedKeys=new Set()) {
 );
 
 // 2) Estado da sala passa a informar anfitrião e limite.
+replaceText(
+  "function opponent(room, p) { return room.players.find(x=>x.id!==p.id) || null; }",
+`function cleanClientKey(value) {
+  return String(value || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 80);
+}
+function opponent(room, p) { return room.players.find(x=>x.id!==p.id) || null; }`,
+  'identidade persistente do aparelho'
+);
+
 replaceRegex(
   /function roomSummary\(room, forPlayerId=null\) \{[\s\S]*?\n\}/,
 `function roomSummary(room, forPlayerId=null) {
@@ -92,7 +101,7 @@ replaceRegex(
 // 3) Criador vira anfitrião.
 replaceText(
   "function createRoom(name, category) {",
-  "function createRoom(name, category, difficulty) {",
+  "function createRoom(name, category, difficulty, clientKey) {",
   'nível definido pelo criador'
 );
 
@@ -123,26 +132,26 @@ replaceText(
 
 replaceText(
   "function addPlayer(room, name) {",
-  "function addPlayer(room, name, waitingNext=false) {",
+  "function addPlayer(room, name, waitingNext=false, clientKey='') {",
   'entrada de espectador'
 );
 
 replaceText(
   "    answer: null, rematch: false\n  };",
-  "    answer: null, rematch: false, waitingNext: false, lastChatAt: 0\n  };",
+  "    answer: null, rematch: false, waitingNext: false, lastChatAt: 0,\n    clientKey: cleanClientKey(clientKey), hasConnected: false, disconnectTimer: null\n  };",
   'estado inicial do anfitrião'
 );
 
 replaceText(
   "    answer: null, rematch: false\n  };",
-  "    answer: null, rematch: false, waitingNext: !!waitingNext, lastChatAt: 0\n  };",
+  "    answer: null, rematch: false, waitingNext: !!waitingNext, lastChatAt: 0,\n    clientKey: cleanClientKey(clientKey), hasConnected: false, disconnectTimer: null\n  };",
   'estado de quem entra na sala'
 );
 
 replaceText(
   "    answered: !!p.answer,\n    rematch: !!p.rematch",
-  "    answered: !!p.answer,\n    rematch: !!p.rematch,\n    waitingNext: !!p.waitingNext",
-  'estado público de espectador'
+  "    answered: !!p.answer,\n    rematch: !!p.rematch,\n    waitingNext: !!p.waitingNext,\n    hasConnected: !!p.hasConnected",
+  'estado público de reconexão'
 );
 
 // 5) Helpers multiplayer antes de resetMatch.
@@ -153,6 +162,18 @@ replaceText(
 }
 function activePlayers(room) {
   return room.players.filter(p=>!p.waitingNext);
+}
+function maybeEndQuestion(room, delay=ANSWER_REVEAL_DELAY_MS) {
+  if (room.status !== 'playing' || room.questionEnding) return;
+  const participants = activePlayers(room);
+  const someoneAnswered = participants.some(p=>p.answer);
+  const stillExpected = participants.some(p=>
+    !p.answer && (!p.hasConnected || p.connected)
+  );
+  if (!someoneAnswered || stillExpected) return;
+  room.questionEnding = true;
+  clearTimeout(room.questionTimer);
+  room.questionTimer = setTimeout(()=>endQuestion(room, 'all-online-answered'), delay);
 }
 function cleanChatText(value) {
   return String(value || '')
@@ -184,7 +205,8 @@ function sendChatMessage(room, player, value) {
 }
 function startByHost(room, player) {
   if (player.id !== room.hostId) return {ok:false,error:'NOT_HOST'};
-  if (room.players.length < 2) return {ok:false,error:'NEED_PLAYERS'};
+  const readyPlayers = room.players.filter(p=>p.connected || !p.hasConnected);
+  if (readyPlayers.length < 2) return {ok:false,error:'NEED_PLAYERS'};
   if (room.status !== 'waiting' && room.status !== 'finished') {
     return {ok:false,error:'ALREADY_STARTED'};
   }
@@ -197,6 +219,7 @@ function leaveRoom(room, player) {
   const wasHost = room.hostId === player.id;
 
   room.players.splice(index, 1);
+  clearTimeout(player.disconnectTimer);
   try { if (player.sse) player.sse.end(); } catch (_) {}
   player.sse = null;
   player.connected = false;
@@ -217,10 +240,7 @@ function leaveRoom(room, player) {
   touch(room);
   broadcastRoomState(room);
 
-  if (room.status === 'playing' && activePlayers(room).every(p=>p.answer)) {
-    clearTimeout(room.questionTimer);
-    room.questionTimer = setTimeout(()=>endQuestion(room, 'all-answered'), 250);
-  }
+  maybeEndQuestion(room, 250);
   return {ok:true};
 }
 function resetMatch(room) {`,
@@ -258,7 +278,7 @@ replaceText(
     p.rematch = false;`,
 `    p.answer = null;
     p.rematch = false;
-    p.waitingNext = false;`,
+    p.waitingNext = !!(p.hasConnected && !p.connected);`,
   'espectadores entram na nova rodada'
 );
 
@@ -296,6 +316,7 @@ replaceText(
   for (const p of room.players) p.answer = null;`,
 `  room.status = 'playing';
   room.questionStartedAt = now();
+  room.questionEnding = false;
   room.lastReveal = null;
   for (const p of room.players) p.answer = null;`,
   'estado da pergunta recuperável'
@@ -351,10 +372,7 @@ replaceText(
     totalPlayers: participants.length
   });
 
-  if (participants.every(p=>p.answer)) {
-    clearTimeout(room.questionTimer);
-    room.questionTimer = setTimeout(()=>endQuestion(room, 'all-answered'), ANSWER_REVEAL_DELAY_MS);
-  }`,
+  maybeEndQuestion(room);`,
   'respostas de todos os jogadores'
 );
 
@@ -482,7 +500,7 @@ replaceText(
 // 10) Entrada não inicia automaticamente e respeita MAX_PLAYERS.
 replaceText(
   "      const {room,player}=createRoom(body.name,body.category);",
-  "      const {room,player}=createRoom(body.name,body.category,body.difficulty);",
+  "      const {room,player}=createRoom(body.name,body.category,body.difficulty,body.clientKey);",
   'nível recebido ao criar a sala'
 );
 
@@ -498,13 +516,21 @@ replaceText(
       // Let response reach client before countdown event.
       setTimeout(()=>startCountdown(room),400);
       return;`,
-`      if(room.players.length>=MAX_PLAYERS) {
+`      const clientKey = cleanClientKey(body.clientKey);
+      const previous = clientKey && room.players.find(p=>p.clientKey===clientKey);
+      if(!previous && room.players.length>=MAX_PLAYERS) {
         return json(res,409,{ok:false,error:'ROOM_UNAVAILABLE'});
       }
       const waitingNext = room.status !== 'waiting';
-      const player=addPlayer(room,body.name,waitingNext);
+      const player = previous || addPlayer(room,body.name,waitingNext,clientKey);
+      if (previous) {
+        player.name = cleanName(body.name);
+        clearTimeout(player.disconnectTimer);
+        touch(room);
+      }
       json(res,200,{
-        ok:true, code, playerId:player.id, token:player.token, waitingNext,
+        ok:true, code, playerId:player.id, token:player.token,
+        waitingNext:!!player.waitingNext, reconnected:!!previous,
         room:roomSummary(room,player.id)
       });
       setTimeout(()=>broadcastRoomState(room),50);
@@ -528,6 +554,19 @@ replaceText(
 
 // 12) Conexão/desconexão atualiza a lista para todos.
 replaceText(
+`      player.sse=res;
+      player.connected=true;
+      touch(room);`,
+`      player.sse=res;
+      player.connected=true;
+      player.hasConnected=true;
+      clearTimeout(player.disconnectTimer);
+      player.disconnectTimer=null;
+      touch(room);`,
+  'reconexão cancela a espera de desconexão'
+);
+
+replaceText(
 `      sendPlayer(player,'connected',{
         room:roomSummary(room,player.id)
       });`,
@@ -545,7 +584,12 @@ replaceText(
 replaceText(
 `        const op=opponent(room,player);
         if(op) sendPlayer(op,'opponent-connection',{connected:false,opponent:publicPlayer(player)});`,
-`        broadcastRoomState(room);`,
+`        broadcastRoomState(room);
+        clearTimeout(player.disconnectTimer);
+        player.disconnectTimer=setTimeout(()=>{
+          player.disconnectTimer=null;
+          if (!player.connected) maybeEndQuestion(room);
+        }, DISCONNECT_GRACE_MS);`,
   'desconexão atualizada para todos'
 );
 

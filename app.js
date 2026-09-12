@@ -11,6 +11,51 @@ let audioCtx = null;
 let lastResult = null;
 let chatMessages = [];
 let chatUnread = 0;
+const SESSION_PREFIX = 'dbo_session_';
+const ACTIVE_TAB_PREFIX = 'dbo_active_tab_';
+const tabId = (crypto.randomUUID?.() || Math.random().toString(36).slice(2));
+
+function browserClientKey() {
+  let key = localStorage.getItem('dbo_client_key');
+  if (!key) {
+    key = (crypto.randomUUID?.() || `${Date.now()}-${Math.random()}`).replace(/[^a-zA-Z0-9_-]/g, '');
+    localStorage.setItem('dbo_client_key', key);
+  }
+  return key;
+}
+
+function saveRoomSession(value) {
+  if (!value?.code) return;
+  localStorage.setItem(SESSION_PREFIX + value.code, JSON.stringify(value));
+  localStorage.setItem('dbo_last_room', value.code);
+  sessionStorage.setItem('dbo_session', JSON.stringify(value));
+}
+
+function readRoomSession(code) {
+  const roomCode = String(code || '').toUpperCase();
+  const exact = roomCode && localStorage.getItem(SESSION_PREFIX + roomCode);
+  const legacy = sessionStorage.getItem('dbo_session');
+  try {
+    const value = JSON.parse(exact || legacy || 'null');
+    if (!value?.code || (roomCode && value.code !== roomCode)) return null;
+    return value;
+  } catch (_) {
+    return null;
+  }
+}
+
+function removeRoomSession(value) {
+  if (value?.code) {
+    localStorage.removeItem(SESSION_PREFIX + value.code);
+    localStorage.removeItem(ACTIVE_TAB_PREFIX + value.code);
+  }
+  sessionStorage.removeItem('dbo_session');
+}
+
+function claimActiveTab() {
+  if (!session?.code) return;
+  localStorage.setItem(ACTIVE_TAB_PREFIX + session.code, tabId);
+}
 
 function show(id) {
   document.querySelectorAll('.screen').forEach(s => {
@@ -129,6 +174,7 @@ function closeEvents() {
 
 function connectEvents() {
   closeEvents();
+  claimActiveTab();
   setConnectionStatus('connecting');
   const q = new URLSearchParams({
     code: session.code,
@@ -531,7 +577,9 @@ function updateWaiting(room) {
   const count = $('playersCount');
   if (!list || !count) return;
 
-  count.textContent = `${room.players.length} ${room.players.length === 1 ? 'jogador' : 'jogadores'}${room.maxPlayers ? ` / ${room.maxPlayers}` : ''}`;
+  const readyPlayers = room.players.filter(p => p.connected || !p.hasConnected);
+  const reconnecting = room.players.length - readyPlayers.length;
+  count.textContent = `${readyPlayers.length} ${readyPlayers.length === 1 ? 'jogador pronto' : 'jogadores prontos'}${room.maxPlayers ? ` / ${room.maxPlayers}` : ''}${reconnecting ? ` • ${reconnecting} reconectando` : ''}`;
   list.innerHTML = room.players.map((p, i) => {
     const host = p.id === room.hostId;
     const me = p.id === session.playerId;
@@ -539,7 +587,7 @@ function updateWaiting(room) {
       <div class="multiPlayerRow ${me ? 'me' : ''}">
         <div class="avatar">${host ? '👑' : p.waitingNext ? '👀' : '🙂'}</div>
         <div class="name">${escapeHtml(p.name)}${me ? ' (você)' : ''}</div>
-        <div class="status">${p.waitingNext ? '⏳ PRÓXIMA' : p.connected ? '🟢 ONLINE' : '⚪ ENTRANDO'}</div>
+        <div class="status">${p.waitingNext ? '⏳ PRÓXIMA' : p.connected ? '🟢 ONLINE' : p.hasConnected ? '🟡 RECONECTANDO' : '⚪ ENTRANDO'}</div>
       </div>`;
   }).join('');
 
@@ -547,8 +595,8 @@ function updateWaiting(room) {
   if (startBtn) {
     if (isHost(room)) {
       startBtn.style.display = '';
-      startBtn.disabled = room.players.length < 2 || room.status !== 'waiting';
-      startBtn.textContent = room.players.length < 2 ? 'AGUARDANDO MAIS 1 JOGADOR' : `▶️ INICIAR COM ${room.players.length} JOGADORES`;
+      startBtn.disabled = readyPlayers.length < 2 || room.status !== 'waiting';
+      startBtn.textContent = readyPlayers.length < 2 ? 'AGUARDANDO MAIS 1 JOGADOR' : `▶️ INICIAR COM ${readyPlayers.length} JOGADORES`;
     } else {
       startBtn.style.display = '';
       startBtn.disabled = true;
@@ -893,10 +941,11 @@ async function createRoom() {
     const j = await api('/api/create-room', {
       name,
       category: $('categorySelect').value,
-      difficulty: Number($('difficultySelect').value)
+      difficulty: Number($('difficultySelect').value),
+      clientKey: browserClientKey()
     });
     session = {code: j.code, playerId: j.playerId, token: j.token};
-    sessionStorage.setItem('dbo_session', JSON.stringify(session));
+    saveRoomSession(session);
     history.replaceState(null, '', `/?room=${j.code}`);
     setChatVisible(true);
     show('waitingScreen');
@@ -929,16 +978,17 @@ async function joinRoom() {
   button.disabled = true;
   button.textContent = 'ENTRANDO…';
   try {
-    const j = await api('/api/join-room', {name, code});
+    const j = await api('/api/join-room', {name, code, clientKey: browserClientKey()});
     session = {code: j.code, playerId: j.playerId, token: j.token};
-    sessionStorage.setItem('dbo_session', JSON.stringify(session));
+    saveRoomSession(session);
     history.replaceState(null, '', `/?room=${j.code}`);
     roomState = j.room;
     setChatVisible(true);
     show('waitingScreen');
     updateWaiting(j.room);
     connectEvents();
-    if (j.waitingNext) toast('A rodada está em andamento. Você entra na próxima!');
+    if (j.reconnected) toast('Você voltou para sua vaga na sala.');
+    else if (j.waitingNext) toast('A rodada está em andamento. Você entra na próxima!');
   } catch (e) {
     if (e.code === 'ROOM_NOT_FOUND') toast('Sala não encontrada.');
     else if (e.code === 'ROOM_UNAVAILABLE') toast('Essa sala atingiu o limite de jogadores.');
@@ -955,8 +1005,9 @@ async function startMatch() {
     toast('Somente o anfitrião pode iniciar.');
     return;
   }
-  if (roomState.players.length < 2) {
-    toast('É preciso pelo menos 2 jogadores.');
+  const readyPlayers = roomState.players.filter(p => p.connected || !p.hasConnected);
+  if (readyPlayers.length < 2) {
+    toast('É preciso pelo menos 2 jogadores conectados.');
     return;
   }
   const btn = $('startMatchBtn');
@@ -965,7 +1016,7 @@ async function startMatch() {
     await api('/api/action', sessionBody({action: 'start'}));
   } catch (e) {
     if (e.code === 'NOT_HOST') toast('Somente o anfitrião pode iniciar.');
-    else if (e.code === 'NEED_PLAYERS') toast('É preciso pelo menos 2 jogadores.');
+    else if (e.code === 'NEED_PLAYERS') toast('É preciso pelo menos 2 jogadores conectados.');
     else toast('Não foi possível iniciar a partida.');
     if (btn) btn.disabled = false;
   }
@@ -1031,17 +1082,17 @@ async function goHome() {
   setChatVisible(false);
   renderChatMessages();
   updateChatUnread();
-  sessionStorage.removeItem('dbo_session');
+  removeRoomSession(old);
   history.replaceState(null, '', '/');
   show('homeScreen');
   setConnectionStatus('offline');
 }
 
-async function tryRestore() {
-  const saved = sessionStorage.getItem('dbo_session');
+async function tryRestore(roomCode) {
+  const saved = readRoomSession(roomCode);
   if (!saved) return false;
   try {
-    session = JSON.parse(saved);
+    session = saved;
     const q = new URLSearchParams({code: session.code, playerId: session.playerId, token: session.token});
     const r = await fetch('/api/state?' + q);
     if (!r.ok) throw new Error('RESTORE');
@@ -1050,8 +1101,8 @@ async function tryRestore() {
     applySyncState(j);
     return true;
   } catch (_) {
+    removeRoomSession(session);
     session = null;
-    sessionStorage.removeItem('dbo_session');
     return false;
   }
 }
@@ -1088,12 +1139,34 @@ document.addEventListener('keydown', e => {
 window.addEventListener('online', () => setConnectionStatus(session ? 'connecting' : 'offline'));
 window.addEventListener('offline', () => setConnectionStatus('connecting'));
 window.addEventListener('beforeunload', closeEvents);
+window.addEventListener('storage', event => {
+  if (!session?.code || event.key !== ACTIVE_TAB_PREFIX + session.code) return;
+  if (event.newValue && event.newValue !== tabId) {
+    closeEvents();
+    setConnectionStatus('connecting');
+  }
+});
+document.addEventListener('visibilitychange', async () => {
+  if (document.hidden || !session?.code) return;
+  const owner = localStorage.getItem(ACTIVE_TAB_PREFIX + session.code);
+  if (owner === tabId && eventSource) return;
+  try {
+    claimActiveTab();
+    const q = new URLSearchParams({code: session.code, playerId: session.playerId, token: session.token});
+    const response = await fetch('/api/state?' + q);
+    if (!response.ok) throw new Error('RESTORE');
+    connectEvents();
+    applySyncState(await response.json());
+  } catch (_) {
+    setConnectionStatus('connecting');
+  }
+});
 
 (async function init() {
   loadName();
   setSound(soundOn);
   const room = new URL(location.href).searchParams.get('room');
   if (room) $('roomCodeInput').value = room.toUpperCase().slice(0, 6);
-  const restored = await tryRestore();
+  const restored = await tryRestore(room);
   if (!restored) show('homeScreen');
 })();
